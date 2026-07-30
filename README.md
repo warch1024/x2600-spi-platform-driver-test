@@ -1,77 +1,99 @@
-# X2600 EVB 2.0 SPI1 性能测试
+# X2600 SPI 60MHz 测试
 
-本目录测试 X2600 的 **SPI1 PC25 引脚组**。当前默认总线为 1。
+`app_spi` 只保留 CS 时序测量、快速完整测试和 60MHz 正式资格测试。
 
-## Kconfig 与接线
+## 硬件条件
 
-在工程 Kconfig 中启用 SPI1，并选择 PC25 组：
+`x2600_nor_5.10_defconfig` 同时启用两路控制器，并将 `div_ssi` 请求为
+120MHz。SSI 最快分频档对应 60MHz SCLK。将板端结果作为引脚级结论前，必须用
+示波器确认实际 SCLK 为 60MHz。
+
+| 总线 | SCLK | MOSI | MISO | 软件 CS | 硬件 CE0 |
+|---|---|---|---|---|---|
+| SPI0 | PD00 | PD01 | PD02 | PC09 | PD05 |
+| SPI1 | PC25 | PC26 | PC27 | PC30 | PC30 |
+
+每次外部全双工测试均须在对应总线的 SoC 侧短接 MOSI 与 MISO，并使仪器和开发板
+共地。两路 SPI 共用 SSI 源时钟，因此资格测试会先后执行 SPI0、SPI1，而不会并发。
+
+SPI1 的 PC25-PC30 与 MSC1 复用。测试 SPI1 前保持 `MD_X2600_510_MSC` 关闭，
+并确认未加载 `soc_msc`。
+
+## 构建
+
+```sh
+make test
+make app
+```
+
+`make test` 在主机执行样本统计单元测试；`make app` 使用配置好的 Buildroot
+交叉编译器生成 MIPS 程序。
+
+## 快速完整测试
+
+快速完整测试在外部全双工数据校验下扫描
+1/5/10/20/25/50/60MHz。每档使用四种数据图样，报告最高无错请求频率和有效负载
+带宽。
+
+```sh
+# SPI0
+./app_spi --mode complete --bus 0 --cs pc09 --ssi-source-hz 120000000 \
+  --report /tmp/spi0_complete.md
+
+# SPI1
+./app_spi --mode complete --bus 1 --cs pc30 --ssi-source-hz 120000000 \
+  --report /tmp/spi1_complete.md
+```
+
+报告带宽是用户态有效负载带宽，包含图样生成、spidev 分块、ioctl 和 RX 数据比较，
+不是 SCLK 的原始线速。
+
+## CS 时序测量
+
+`delay` 模式在 1MHz、10MHz、60MHz 产生独立采样传输。用仪器测量 SCLK 频率以及
+CS 下降沿到首个 SCLK 边沿的时间；程序会记录交互输入的测量值。
+
+```sh
+# SPI1 软件 GPIO CS：PC30 -> PC25
+./app_spi --mode delay --bus 1 --cs pc30 --ssi-source-hz 120000000
+
+# SPI1 硬件 CE0：PC30/SSI1_CE0 -> PC25
+./app_spi --mode delay --bus 1 --hw-cs pc30 --ssi-source-hz 120000000
+
+# SPI0 硬件 CE0：PD05/SSI0_CE0 -> PD00
+./app_spi --mode delay --bus 0 --hw-cs pd05 --ssi-source-hz 120000000
+```
+
+## 正式资格测试
+
+`--qualification` 是一个自动命令：使用固定软件 CS 配置先测试 SPI0，再测试
+SPI1。该命令必须传入 120MHz 源时钟参数，不接受总线或 CS 覆盖参数。
+
+```sh
+./app_spi --qualification --ssi-source-hz 120000000 --report /tmp/spi_qualification.md
+```
+
+每个 SPI 的执行顺序如下：
+
+1. 扫描外部全双工无错 60MHz 传输。
+2. 对全部长度执行短时预检：每个主长度和边界长度各做一次内部 LOOP 校验，随后
+   外部随机数据全双工比较至少持续 5 秒。
+3. 测量经过数据校验的外部全双工带宽：`16KiB`、`128KiB`、`1MiB` 每档
+   1000 个样本，每样本至少 2.5 秒。
+4. 测量 `127`、`128`、`129`、`4095`、`4096`、`4097B` 边界；每档 60 个样本，
+   每样本至少 5 秒。
+5. 执行 64KiB 外部全双工随机数据压力测试 90 分钟，并记录数据校验后的有效带宽。
+
+单路长测部分至少 4 小时 5 分。计入预检和频率扫描，自动完成 SPI0、SPI1 的命令
+耗时略高于 8 小时 10 分。一个总线预检失败时，程序跳过该总线的长测，但仍会开始
+下一总线，除非操作者中断程序。
+
+Markdown 报告包含每个用例的中位数、最小值、最大值、均值、样本标准差、完成负载
+和错误信息。每个独立样本另写入同名 CSV，例如：
 
 ```text
-MD_X2600_510_SPI=y
-MD_X2600_510_SPI1=y
-MD_X2600_510_SPI1_CLK=PC25
-MD_X2600_510_SPI1_MOSI=PC26
-MD_X2600_510_SPI1_MISO=PC27
+/tmp/spi_qualification.md.csv
 ```
 
-PC25-PC30 同时复用为 MSC1。测试期间应关闭 `MD_X2600_510_MSC` 或至少 `MD_X2600_510_MSC1`，并确认系统未加载 `soc_msc`。当前 `x2600_nor_5.10_defconfig` 已关闭整个 MSC 模块。
-
-EVB 2.0 的 CON11 引脚：
-
-| 信号 | X2600 引脚 | CON11 引脚 | 用途 |
-|---|---|---:|---|
-| SCLK | PC25 | 2 | SPI1 时钟、仪器测量 |
-| MISO | PC27 | 3 | 外部回环接收 |
-| MOSI | PC26 | 4 | 外部回环发送 |
-| CS | PC30 | 6 | 软件 GPIO CS 或硬件 SSI1_CE0 |
-
-将 **PC26(MOSI) 与 PC27(MISO) 短接**，并让仪器和 EVB 共地。软件 CS 与硬件 CS 都使用 PC30：程序先将其作为 GPIO 软件 CS，硬件阶段会注销软件 CS 设备，再把 PC30 切换为 `func1` 的 `SSI1_CE0`。
-
-## 完整测试
-
-已确认 SSI 源时钟为 96 MHz，最高实际 SCLK 是 48 MHz：
-
-```sh
-make app
-adb push app_spi /tmp/app_spi
-adb shell
-cd /tmp
-chmod 755 app_spi
-./app_spi --mode complete --ssi-source-hz 96000000 --bus 1 \
-  --cs pc30 --hw-cs pc30 --report /tmp/spi1_complete.md
-```
-
-完整模式执行：
-
-1. PC26-PC27 外部回环扫描，确认最高无错频率。
-2. 48 MHz 下的 `SPI_LOOP`、仅写、仅读、外部全双工随机数据性能；数据长度为 16 KiB、64 KiB、256 KiB、1 MiB。
-3. PC30 软件 GPIO CS 到 PC25 首个 SCLK 的 1/10/48 MHz 时序。
-4. PC30 硬件 SSI1_CE0 到 PC25 首个 SCLK 的 1/10/48 MHz 时序。
-
-`SPI_LOOP` 不输出有效引脚波形。仅写路径物理上会接收 MISO，但驱动丢弃 RX FIFO 数据，因此不校验；仅读以虚拟 0 产生时钟；外部全双工逐字节校验随机 TX/RX 数据。
-
-## 单独 CS 时序
-
-```sh
-# 软件 CS：PC30 -> PC25，依次触发 1 / 10 / 48 MHz
-./app_spi --mode delay --ssi-source-hz 96000000 --bus 1 --cs pc30
-
-# 硬件 CS：PC30/SSI1_CE0 -> PC25，依次触发 1 / 10 / 48 MHz
-./app_spi --mode delay --ssi-source-hz 96000000 --bus 1 --hw-cs pc30
-```
-
-每档会先执行一次未触发的短传输，释放可能被旧驱动保留的 CS；正式采样传输使用 `cs_change=1`，结束后明确释放 CS。因此每档应有独立的 CS 高-低-高波形。
-
-## 连续 SCLK 与 MOSI 图样
-
-```sh
-/module_driver/app_spi --freq 48000000 --bus 1 --report /tmp/spi1_freq.md
-```
-
-该模式不执行性能测试，使用 `soc_spi` 的 TX/RX 循环 DMA 持续发送 `0x55` 并持续回收 RX FIFO。在 MSB-first、mode 0 下，PC26(MOSI) 输出重复的 `01010101`，PC25 持续输出请求 SCLK；按 Ctrl-C 停止。它不经过 spidev 分块 ioctl，因此没有用户态块边界造成的 SCLK 间隙。
-
-`--freq 80000000` 仅请求 80 MHz；在 96 MHz SSI 源时钟下实际会受分频限制为 48 MHz。观察 48 MHz 波形时直接使用 `--freq 48000000`。
-
-构建工程并烧录 rootfs 后，程序安装在 `/module_driver/app_spi`，正常重启不会清空。`/tmp` 是临时文件系统，会在重启后清空；`buildroot/output/target` 是主机的 rootfs 构建暂存目录，重新构建时也可能被重建。
-
-24 MS/s 逻辑分析仪能确认 CS 是否翻转，也能粗略观察低速时钟，但无法可靠量 48 MHz 周期或几十纳秒的 CS 时序。48 MHz 建议使用至少 500 MS/s 的逻辑分析仪，或 200 MHz 带宽、1 GS/s 采样率的示波器。
+所有外部数据通路都同时使用 TX/RX 缓冲区，并逐字节比较接收数据和发送随机数据。
+字节数、传输次数和错误次数均使用 64 位计数，包括 90 分钟压力测试的结果。
