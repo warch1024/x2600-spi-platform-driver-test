@@ -37,6 +37,7 @@
 typedef enum {
   TEST_MODE_COMPLETE,
   TEST_MODE_DELAY,
+  TEST_MODE_ALWAYS_SPEED,
 } test_mode_t;
 
 typedef struct {
@@ -56,6 +57,7 @@ typedef struct {
   unsigned int cs_arm_ms;
   unsigned int cs_to_clk_ns;
   unsigned int ssi_source_hz;
+  unsigned int always_speed;
   int cs_to_clk_ns_valid;
   int bus_specified;
   int cs_specified;
@@ -98,7 +100,7 @@ static const qualification_profile_t qualification_profiles[] = {
 };
 
 static const unsigned int scan_speeds[] = {
-    1000000U, 5000000U, 10000000U, 20000000U,
+    1000000U,  5000000U,  10000000U,    20000000U,
     25000000U, 50000000U, TEST_SCLK_HZ,
 };
 
@@ -114,6 +116,8 @@ static const size_t boundary_lengths[] = {
 
 static volatile sig_atomic_t stop_requested;
 static test_report_t report;
+
+static unsigned int max_supported_sclk(unsigned int source_hz);
 
 static int add_u64(uint64_t *value, uint64_t amount) {
   if (UINT64_MAX - *value < amount)
@@ -136,7 +140,11 @@ static void on_signal(int signo) {
 static const char *mode_name(const test_options_t *opt) {
   if (opt->qualification)
     return "60MHz 资格测试";
-  return opt->mode == TEST_MODE_DELAY ? "CS 时序测量" : "快速完整测试";
+  if (opt->mode == TEST_MODE_DELAY)
+    return "CS 时序测量";
+  if (opt->mode == TEST_MODE_ALWAYS_SPEED)
+    return "连续频率发送";
+  return "快速完整测试";
 }
 
 static void report_vprintf(const char *fmt, va_list ap) {
@@ -209,9 +217,8 @@ static int report_open(const test_options_t *opt) {
       report.fp = NULL;
       return -1;
     }
-    if (fprintf(report.samples_fp,
-                "bus,phase,length_bytes,sample,elapsed_ms,payload_bytes,mbit_per_s\n") <
-            0 ||
+    if (fprintf(report.samples_fp, "bus,phase,length_bytes,sample,elapsed_ms,"
+                                   "payload_bytes,mbit_per_s\n") < 0 ||
         fflush(report.samples_fp) != 0) {
       fclose(report.samples_fp);
       fclose(report.fp);
@@ -224,10 +231,13 @@ static int report_open(const test_options_t *opt) {
   report_printf("# X2600 SPI 60MHz 测试报告\n\n");
   report_printf("- 生成时间: %s", ctime(&now.tv_sec));
   report_printf("- 测试模式: `%s`\n", mode_name(opt));
-  report_printf("- 驱动源码: `/home/devvean/work/linux/module_driver/soc/x2600_510/spi/spi.c`\n");
+  report_printf(
+      "- 驱动源码: "
+      "`/home/devvean/work/linux/module_driver/soc/x2600_510/spi/spi.c`\n");
   report_printf("- SCLK 目标: 60000000 Hz；SSI 源时钟参数: %u Hz\n\n",
                 opt->ssi_source_hz);
-  report_printf("## 结果明细\n\n| 状态 | 类别 | 用例 | 详情 |\n|---|---|---|---|\n");
+  report_printf(
+      "## 结果明细\n\n| 状态 | 类别 | 用例 | 详情 |\n|---|---|---|---|\n");
   return 0;
 }
 
@@ -298,8 +308,14 @@ static int parse_args(int argc, char **argv, test_options_t *opt) {
     if (i + 1 >= argc)
       return -1;
     if (!strcmp(argv[i], "--mode")) {
-      if (parse_mode(argv[++i], &opt->mode) < 0)
+      if (!strcmp(argv[++i], "always-speed")) {
+        opt->mode = TEST_MODE_ALWAYS_SPEED;
+        if (++i >= argc || parse_uint(argv[i], &opt->always_speed) < 0 ||
+            !opt->always_speed)
+          return -1;
+      } else if (parse_mode(argv[i], &opt->mode) < 0) {
         return -1;
+      }
     } else if (!strcmp(argv[i], "--bus")) {
       if (parse_uint(argv[++i], &opt->bus) < 0)
         return -1;
@@ -321,16 +337,14 @@ static int parse_args(int argc, char **argv, test_options_t *opt) {
       if (parse_uint(argv[++i], &opt->scan_loops) < 0 || !opt->scan_loops)
         return -1;
     } else if (!strcmp(argv[i], "--cs-arm-ms")) {
-      if (parse_uint(argv[++i], &opt->cs_arm_ms) < 0 ||
-          opt->cs_arm_ms > 60000U)
+      if (parse_uint(argv[++i], &opt->cs_arm_ms) < 0 || opt->cs_arm_ms > 60000U)
         return -1;
     } else if (!strcmp(argv[i], "--cs-to-clk-ns")) {
       if (parse_uint(argv[++i], &opt->cs_to_clk_ns) < 0)
         return -1;
       opt->cs_to_clk_ns_valid = 1;
     } else if (!strcmp(argv[i], "--ssi-source-hz")) {
-      if (parse_uint(argv[++i], &opt->ssi_source_hz) < 0 ||
-          !opt->ssi_source_hz)
+      if (parse_uint(argv[++i], &opt->ssi_source_hz) < 0 || !opt->ssi_source_hz)
         return -1;
     } else if (!strcmp(argv[i], "--report")) {
       opt->report_name = argv[++i];
@@ -340,25 +354,37 @@ static int parse_args(int argc, char **argv, test_options_t *opt) {
   }
   if (opt->max_transfer < 8U)
     return -1;
+  if (opt->mode == TEST_MODE_ALWAYS_SPEED && opt->ssi_source_hz &&
+      opt->always_speed > max_supported_sclk(opt->ssi_source_hz))
+    return -1;
   if (opt->qualification &&
-      (opt->mode == TEST_MODE_DELAY || opt->bus_specified || opt->cs_specified ||
-       opt->hw_cs_specified || opt->ssi_source_hz != SSI_SOURCE_60MHZ))
+      (opt->mode == TEST_MODE_DELAY || opt->bus_specified ||
+       opt->cs_specified || opt->hw_cs_specified ||
+       opt->ssi_source_hz != SSI_SOURCE_60MHZ))
     return -1;
   return 0;
 }
 
 static void print_usage(const char *name) {
   printf("用法: %s [选项]\n", name);
-  printf("  --mode complete|delay  complete 为默认快速全双工测试；delay 为 CS 时序测试\n");
-  printf("  --qualification         自动完成 SPI0 后 SPI1 的 60MHz 正式资格测试\n");
-  printf("  --bus N                 complete/delay 的 SPI 总线，默认 %u\n", DEFAULT_BUS);
+  printf("  --mode complete|delay  complete 为默认快速全双工测试；delay 为 CS "
+         "时序测试\n");
+  printf("  --mode always-speed HZ 连续发送 0x55，供示波器观察 SCLK/MOSI\n");
+  printf("  --qualification         自动完成 SPI0 后 SPI1 的 60MHz "
+         "正式资格测试\n");
+  printf("  --bus N                 complete/delay 的 SPI 总线，默认 %u\n",
+         DEFAULT_BUS);
   printf("  --cs GPIO               软件 CS；delay 中指定时测软件 CS\n");
   printf("  --hw-cs GPIO            delay 中测硬件 CE0\n");
-  printf("  --max-transfer N        complete 扫描的逻辑负载字节数，默认 %u\n", DEFAULT_MAX_TRANSFER);
-  printf("  --loops N               complete 每档图样轮数，默认 %u\n", DEFAULT_SCAN_LOOPS);
-  printf("  --cs-arm-ms N           CS 仪器捕获等待时间，默认 %u ms\n", DEFAULT_CS_ARM_MS);
+  printf("  --max-transfer N        complete 扫描的逻辑负载字节数，默认 %u\n",
+         DEFAULT_MAX_TRANSFER);
+  printf("  --loops N               complete 每档图样轮数，默认 %u\n",
+         DEFAULT_SCAN_LOOPS);
+  printf("  --cs-arm-ms N           CS 仪器捕获等待时间，默认 %u ms\n",
+         DEFAULT_CS_ARM_MS);
   printf("  --cs-to-clk-ns N        记录已测得的 CS 到首个 SCLK 间隔\n");
-  printf("  --ssi-source-hz HZ      SSI 源时钟；qualification 必须为 120000000\n");
+  printf(
+      "  --ssi-source-hz HZ      SSI 源时钟；qualification 必须为 120000000\n");
   printf("  --report FILE           Markdown 报告路径，默认 /tmp\n");
 }
 
@@ -606,8 +632,7 @@ static unsigned int max_supported_sclk(unsigned int source_hz) {
 
   if (!source_hz)
     return 0;
-  divider = (source_hz + 2U * SSI_IO_MAX_HZ - 1U) /
-            (2U * SSI_IO_MAX_HZ);
+  divider = (source_hz + 2U * SSI_IO_MAX_HZ - 1U) / (2U * SSI_IO_MAX_HZ);
   return source_hz / (2U * divider);
 }
 
@@ -622,15 +647,15 @@ static scan_result_t run_frequency_scan(spi_context_t *ctx,
     char detail[180];
 
     snprintf(detail, sizeof(detail),
-             "SSI 源时钟=%u Hz；按分频规则最高 SCLK=%u Hz",
-             opt->ssi_source_hz, sclk_limit);
+             "SSI 源时钟=%u Hz；按分频规则最高 SCLK=%u Hz", opt->ssi_source_hz,
+             sclk_limit);
     case_result("时钟", "理论上限", 1, detail);
   } else {
     case_result("时钟", "理论上限", 0,
                 "未提供 SSI 源时钟，实际 SCLK 必须由仪器确认");
   }
-  for (i = 0; i < sizeof(scan_speeds) / sizeof(scan_speeds[0]) &&
-              !stop_requested;
+  for (i = 0;
+       i < sizeof(scan_speeds) / sizeof(scan_speeds[0]) && !stop_requested;
        i++) {
     unsigned int speed = scan_speeds[i];
     unsigned char *tx;
@@ -648,7 +673,8 @@ static scan_result_t run_frequency_scan(spi_context_t *ctx,
 
     snprintf(name, sizeof(name), "%uHz", speed);
     if (sclk_limit && speed > sclk_limit) {
-      snprintf(detail, sizeof(detail), "请求频率超过理论上限 %u Hz", sclk_limit);
+      snprintf(detail, sizeof(detail), "请求频率超过理论上限 %u Hz",
+               sclk_limit);
       case_result("时钟与带宽", name, 0, detail);
       continue;
     }
@@ -772,17 +798,18 @@ static void run_instrument_capture(spi_context_t *ctx,
   if (ret == 0)
     ret = raw_transfer(ctx->fd, tx, NULL, 1U, speed, 1U);
   if (ret == 0) {
-    printf("[%s] 探头接 CS=%s，按 Enter 后 %u ms 发起 %zuB 采样传输。\n",
-           kind, cs_label, opt->cs_arm_ms, len);
+    printf("[%s] 探头接 CS=%s，按 Enter 后 %u ms 发起 %zuB 采样传输。\n", kind,
+           cs_label, opt->cs_arm_ms, len);
     (void)getchar();
     usleep(opt->cs_arm_ms * 1000U);
     ret = raw_transfer(ctx->fd, tx, NULL, len, speed, 1U);
   }
-  snprintf(detail, sizeof(detail), "CS=%s 请求频率=%uHz 单次传输=%zuB", cs_label,
-           speed, len);
+  snprintf(detail, sizeof(detail), "CS=%s 请求频率=%uHz 单次传输=%zuB",
+           cs_label, speed, len);
   case_result("仪器", kind, ret >= 0 ? 1 : -1, detail);
   if (ret >= 0) {
-    if (prompt_uint_measurement("输入仪器测得的 SCLK 频率(Hz)", &measured) > 0) {
+    if (prompt_uint_measurement("输入仪器测得的 SCLK 频率(Hz)", &measured) >
+        0) {
       snprintf(detail, sizeof(detail), "实测=%uHz 请求=%uHz", measured, speed);
       case_result("SCLK", kind, measured <= SSI_IO_MAX_HZ ? 1 : -1, detail);
     }
@@ -799,8 +826,7 @@ static void run_instrument_capture(spi_context_t *ctx,
   free(tx);
 }
 
-static void run_cs_timing_sweep(spi_context_t *ctx,
-                                const test_options_t *opt,
+static void run_cs_timing_sweep(spi_context_t *ctx, const test_options_t *opt,
                                 const char *cs_label, const char *kind) {
   static const unsigned int speeds[] = {1000000U, 10000000U, TEST_SCLK_HZ};
   size_t i;
@@ -887,8 +913,9 @@ static int run_preflight(spi_context_t *ctx, unsigned int bus) {
         case_result("预检", name, -1, detail);
         return -1;
       }
-      snprintf(detail, sizeof(detail), "内部 LOOP 通过；外部全双工 %.3fs 完成=%" PRIu64
-               "B", seconds, bytes);
+      snprintf(detail, sizeof(detail),
+               "内部 LOOP 通过；外部全双工 %.3fs 完成=%" PRIu64 "B", seconds,
+               bytes);
       case_result("预检", name, 1, detail);
     }
   }
@@ -896,8 +923,8 @@ static int run_preflight(spi_context_t *ctx, unsigned int bus) {
 }
 
 static int write_sample_csv(unsigned int bus, const char *phase, size_t len,
-                            unsigned int sample, double seconds,
-                            uint64_t bytes, double mbps) {
+                            unsigned int sample, double seconds, uint64_t bytes,
+                            double mbps) {
   if (!report.samples_fp)
     return -1;
   if (fprintf(report.samples_fp, "%u,%s,%zu,%u,%.3f,%" PRIu64 ",%.6f\n", bus,
@@ -947,15 +974,16 @@ static int run_sample_set(spi_context_t *ctx, unsigned int bus,
   }
   snprintf(name, sizeof(name), "%s-%zuB", phase, len);
   if (stats.count != count) {
-    snprintf(detail, sizeof(detail), "仅完成 %zu/%u 个样本", stats.count, count);
+    snprintf(detail, sizeof(detail), "仅完成 %zu/%u 个样本", stats.count,
+             count);
     case_result("资格测试", name, -1, detail);
     return -1;
   }
   snprintf(detail, sizeof(detail),
            "样本=%zu 总负载=%" PRIu64
            "B 中位数=%.3f 最小=%.3f 最大=%.3f 均值=%.3f 标准差=%.3f Mbit/s",
-           stats.count, total_bytes, spi_stats_median(&stats), spi_stats_min(&stats),
-           spi_stats_max(&stats), spi_stats_mean(&stats),
+           stats.count, total_bytes, spi_stats_median(&stats),
+           spi_stats_min(&stats), spi_stats_max(&stats), spi_stats_mean(&stats),
            spi_stats_sample_stddev(&stats));
   case_result("资格测试", name, 1, detail);
   return 0;
@@ -1075,14 +1103,16 @@ static int run_qualification(const test_options_t *opt, size_t spidev_bufsiz) {
   size_t i;
   int failed = 0;
 
-  report_printf("\n## 资格测试参数\n\n- 主长度: 16KiB、128KiB、1MiB；每档 1000 样本，每样本至少 2.5 秒\n"
-                "- 边界: 127/128/129/4095/4096/4097B；每档 60 样本，每样本至少 5 秒\n"
-                "- 压力: 64KiB 外部全双工随机数据 5400 秒\n"
-                "- 原始样本 CSV: `%s`\n",
-                report.samples_path);
-  for (i = 0; i < sizeof(qualification_profiles) /
-                           sizeof(qualification_profiles[0]) &&
-              !stop_requested;
+  report_printf(
+      "\n## 资格测试参数\n\n- 主长度: 16KiB、128KiB、1MiB；每档 1000 "
+      "样本，每样本至少 2.5 秒\n"
+      "- 边界: 127/128/129/4095/4096/4097B；每档 60 样本，每样本至少 5 秒\n"
+      "- 压力: 64KiB 外部全双工随机数据 5400 秒\n"
+      "- 原始样本 CSV: `%s`\n",
+      report.samples_path);
+  for (i = 0;
+       i < sizeof(qualification_profiles) / sizeof(qualification_profiles[0]) &&
+       !stop_requested;
        i++) {
     if (run_qualification_bus(&qualification_profiles[i], opt, spidev_bufsiz) <
         0)
@@ -1105,9 +1135,85 @@ static int run_complete(const test_options_t *opt, size_t spidev_bufsiz) {
   scan = run_frequency_scan(&ctx, opt);
   snprintf(detail, sizeof(detail), "最高无错请求频率=%uHz 有效带宽=%.3fMbit/s",
            scan.highest_speed, scan.payload_mbps);
-  case_result("快速完整测试", "最高无错档", scan.highest_speed ? 1 : -1, detail);
+  case_result("快速完整测试", "最高无错档", scan.highest_speed ? 1 : -1,
+              detail);
   spi_context_deinit(&ctx);
   return scan.highest_speed ? 0 : -1;
+}
+
+static int run_always_speed(const test_options_t *opt, size_t spidev_bufsiz) {
+  spi_context_t ctx;
+  unsigned char *tx = NULL;
+  struct timespec start;
+  struct timespec last_print;
+  struct timespec now;
+  uint64_t bytes = 0;
+  uint64_t transfers = 0;
+  double seconds;
+  int ret = 0;
+  char detail[240];
+
+  if (spi_context_init(&ctx, opt->bus, opt->cs, spidev_bufsiz) < 0) {
+    case_result("连续发送", opt->cs, -1, "注册或打开 spidev 失败");
+    return -1;
+  }
+  if (configure_spi(&ctx, SPI_MODE_0, opt->always_speed) < 0) {
+    case_result("连续发送", "SPI 配置", -1, "SPI 配置或回读失败");
+    spi_context_deinit(&ctx);
+    return -1;
+  }
+  tx = malloc(ctx.spidev_bufsiz);
+  if (!tx) {
+    case_result("连续发送", "发送缓冲区", -1, "分配失败");
+    spi_context_deinit(&ctx);
+    return -1;
+  }
+  memset(tx, 0x55, ctx.spidev_bufsiz);
+  print_driver_parameters(opt->bus);
+  printf("[always-speed] SPI%u 请求=%uHz 单条 message=%zuB MOSI=01010101；"
+         "按 Ctrl-C 停止。\n",
+         opt->bus, opt->always_speed, ctx.spidev_bufsiz);
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  last_print = start;
+  while (!stop_requested) {
+    ret = raw_transfer(ctx.fd, tx, NULL, ctx.spidev_bufsiz, opt->always_speed,
+                       0U);
+    if (ret < 0 || add_u64(&bytes, ctx.spidev_bufsiz) < 0 ||
+        add_u64(&transfers, 1) < 0) {
+      if (ret >= 0)
+        ret = -EOVERFLOW;
+      break;
+    }
+    record_transfer(ctx.spidev_bufsiz, 0);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (elapsed_seconds(&last_print, &now) >= 2.0) {
+      seconds = elapsed_seconds(&start, &now);
+      printf("[always-speed] %.1fs transfer=%" PRIu64 " 发送=%" PRIu64
+             "B 有效带宽=%.3fMbit/s\n",
+             seconds, transfers, bytes,
+             seconds > 0.0 ? (bytes * 8.0 / 1000000.0) / seconds : 0.0);
+      last_print = now;
+    }
+  }
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  seconds = elapsed_seconds(&start, &now);
+  if (ret < 0) {
+    snprintf(detail, sizeof(detail),
+             "返回=%d 完成=%" PRIu64 "B transfer=%" PRIu64 " 耗时=%.3fs", ret,
+             bytes, transfers, seconds);
+    case_result("连续发送", "0x55", -1, detail);
+  } else {
+    snprintf(detail, sizeof(detail),
+             "完成=%" PRIu64 "B transfer=%" PRIu64
+             " 耗时=%.3fs 有效带宽=%.3fMbit/s",
+             bytes, transfers, seconds,
+             seconds > 0.0 ? (bytes * 8.0 / 1000000.0) / seconds : 0.0);
+    case_result("连续发送", "0x55", 1, detail);
+    printf("[always-speed] 已停止: %s\n", detail);
+  }
+  free(tx);
+  spi_context_deinit(&ctx);
+  return ret < 0 ? -1 : 0;
 }
 
 static int run_delay(const test_options_t *opt, size_t spidev_bufsiz) {
@@ -1166,12 +1272,14 @@ int main(int argc, char **argv) {
     ret = run_qualification(&opt, spidev_bufsiz);
   else if (opt.mode == TEST_MODE_DELAY)
     ret = run_delay(&opt, spidev_bufsiz);
+  else if (opt.mode == TEST_MODE_ALWAYS_SPEED)
+    ret = run_always_speed(&opt, spidev_bufsiz);
   else
     ret = run_complete(&opt, spidev_bufsiz);
   if (report_close() < 0)
     ret = -1;
-  printf("SPI 测试完成: 通过=%" PRIu64 " 失败=%" PRIu64
-         " 跳过=%" PRIu64 " 传输=%" PRIu64 " 错误=%" PRIu64 "\n报告: %s\n",
+  printf("SPI 测试完成: 通过=%" PRIu64 " 失败=%" PRIu64 " 跳过=%" PRIu64
+         " 传输=%" PRIu64 " 错误=%" PRIu64 "\n报告: %s\n",
          report.pass, report.fail, report.skip, report.transfers, report.errors,
          report.path[0] ? report.path : "(none)");
   return ret || report.fail || report.output_failed ? 1 : 0;

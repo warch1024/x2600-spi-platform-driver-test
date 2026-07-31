@@ -37,16 +37,33 @@ make app
 
 ```sh
 # SPI0
-./app_spi --mode complete --bus 0 --cs pc09 --ssi-source-hz 120000000 \
-  --report /tmp/spi0_complete.md
+./app_spi --mode complete --bus 0 --cs pc09 --ssi-source-hz 120000000 --report /tmp/spi0_complete.md
 
 # SPI1
-./app_spi --mode complete --bus 1 --cs pc30 --ssi-source-hz 120000000 \
-  --report /tmp/spi1_complete.md
+./app_spi --mode complete --bus 1 --cs pc30 --ssi-source-hz 120000000 --report /tmp/spi1_complete.md
 ```
 
 报告带宽是用户态有效负载带宽，包含图样生成、spidev 分块、ioctl 和 RX 数据比较，
 不是 SCLK 的原始线速。
+
+## 连续频率发送
+
+仪器观察 SCLK 与 MOSI 时，使用 `always-speed` 连续发送 `0x55`。在 mode 0、
+8-bit、MSB-first 下，MOSI 为重复的 `01010101`。该模式每次发送一条长度等于
+检测到的 `spidev.bufsiz` 的 message，不申请 RX 缓冲区，也不进行数据校验，因此
+无需短接 MOSI/MISO。
+
+```sh
+# 默认 SPI1/PC30 软件 CS，观察 PC25(SCLK)、PC26(MOSI) 与 GND
+./app_spi --mode always-speed 60000000 --ssi-source-hz 120000000
+
+# SPI0，观察 PD00(SCLK)、PD01(MOSI) 与 GND
+./app_spi --mode always-speed 60000000 --bus 0 --cs pc09 --ssi-source-hz 120000000
+```
+
+传输循环内不打印。程序每约两秒输出累计发送字节数、传输次数和有效带宽；按
+`Ctrl-C` 正常停止并输出汇总，不显示错误次数。该模式用于观察波形频率，不能替代
+外部全双工数据准确性测试。
 
 ## CS 时序测量
 
