@@ -164,9 +164,10 @@ cd /tmp
 ls -l /dev/fb0 /dev/spidev*
 which memtester fb-test-rect
 
-# 为内核、虚拟 framebuffer 和 app_spi 保留至少 64MiB。
+# 极限内存压力：按启动压力前的 MemAvailable 计算，预留 5MiB。
+# 该值只控制两个 memtester 的申请量；app_spi 运行后的实际剩余内存会继续波动。
 avail_kb=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
-reserve_mb=64
+reserve_mb=5
 each_mb=$(( (avail_kb / 1024 - reserve_mb) / 2 ))
 
 echo "MemAvailable=$((avail_kb / 1024)) MiB, each memtester=${each_mb} MiB"
@@ -181,14 +182,38 @@ mem2=$!
 fb-test-rect -f 0 -s 1 >/tmp/spi-stress/fb-test-rect.log 2>&1 &
 fb=$!
 
-trap 'kill "$mem1" "$mem2" "$fb" 2>/dev/null; wait "$mem1" "$mem2" "$fb" 2>/dev/null' EXIT INT TERM
+cleanup() {
+    kill "$mem1" "$mem2" "$fb" 2>/dev/null
+    wait "$mem1" "$mem2" "$fb" 2>/dev/null
+}
 
-./app_spi --stress --bus 1 --report /tmp/spi-stress/spi1_stress.md
+trap cleanup EXIT INT TERM
+
+sleep 2
+kill -0 "$mem1" || exit 1
+kill -0 "$mem2" || exit 1
+kill -0 "$fb" || exit 1
+
+echo "MemAvailable after stress start: $(awk '$1 == "MemAvailable:" { print $2 / 1024 " MiB" }' /proc/meminfo)"
+
+./app_spi --qualification --ssi-source-hz 120000000 --report /tmp/spi-stress/spi_qualification.md
+result=$?
+
+cleanup
+trap - EXIT INT TERM
+echo "app_spi exit code: $result"
 ```
 
-`memtester ... 0` 会循环执行。不要将系统只保留 5MiB 内存：这会使内核、虚拟
-framebuffer 或 `app_spi` 被 OOM 杀掉，不能作为 SPI 稳定性结论。至少保留 64MiB；若第二个
-`memtester` 无法启动，将 `reserve_mb` 调大到 96 或 128。
+`memtester ... 0` 会循环执行。`reserve_mb=5` 是极限压力设置：按整数 MiB 分配时，两个
+`memtester` 启动后理论上至少留下约 5MiB，但无法保证在 `app_spi`、shell、内核回收和
+framebuffer 继续运行后仍精确剩余 5MiB。上述 `MemAvailable after stress start` 仅作即时
+观测；测试期间可重复执行 `awk '$1 == "MemAvailable:" { print $2 / 1024 " MiB" }' /proc/meminfo`
+查看实际可用内存。
+
+该设置允许 OOM 作为压力现象被记录，但只要出现 `Out of memory` 或 `Killed process`，该轮
+SPI 结果只能说明极限内存耗尽时的行为，不能作为“60MHz SPI 稳定”的通过结论。若要获得有效的
+稳定性结论，恢复 `reserve_mb=64`；若第二个 `memtester` 在 5MiB 设置下无法启动，说明系统
+启动开销已超过可承受范围，应调大 `reserve_mb`，而不是强行继续。
 
 测试结束后检查 `/tmp/spi-stress/spi1_stress.md`、两个 `memtester` 日志、
 `fb-test-rect.log` 和 `dmesg`。SPI 报告的“失败”和“数据错误”必须为零；`dmesg` 中不能出现
