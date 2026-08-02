@@ -1,0 +1,6 @@
+.*
+!.gitignore
+tests/
+test_results/*
+docs/
+work_linux_modify_record/
