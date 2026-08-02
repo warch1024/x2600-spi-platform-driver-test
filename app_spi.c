@@ -18,7 +18,10 @@
 #include <libhardware2/gpio.h>
 #include <libhardware2/spi.h>
 
+#include "spi_clock.h"
 #include "spi_stats.h"
+#include "spi_stress.h"
+#include "spi_timing.h"
 
 #define DEFAULT_BUS          1U
 #define DEFAULT_CS           "pc30"
@@ -32,12 +35,12 @@
 #define SSI_SOURCE_60MHZ     120000000U
 #define TEST_SCLK_HZ         60000000U
 #define STRESS_LENGTH        (64U * 1024U)
-#define STRESS_SECONDS       5400.0
 
 typedef enum {
     TEST_MODE_COMPLETE,
     TEST_MODE_DELAY,
     TEST_MODE_ALWAYS_SPEED,
+    TEST_MODE_MAX_SCLK,
 } test_mode_t;
 
 typedef struct {
@@ -57,12 +60,15 @@ typedef struct {
     unsigned int cs_arm_ms;
     unsigned int cs_to_clk_ns;
     unsigned int ssi_source_hz;
+    unsigned int div_ssi_rate;
     unsigned int always_speed;
+    unsigned int stress_seconds;
     int cs_to_clk_ns_valid;
     int bus_specified;
     int cs_specified;
     int hw_cs_specified;
     int qualification;
+    int stress;
     test_mode_t mode;
     const char *report_name;
 } test_options_t;
@@ -141,10 +147,14 @@ static const char *mode_name(const test_options_t *opt)
 {
     if (opt->qualification)
         return "60MHz 资格测试";
+    if (opt->stress)
+        return "60MHz 独立压力测试";
     if (opt->mode == TEST_MODE_DELAY)
         return "CS 时序测量";
     if (opt->mode == TEST_MODE_ALWAYS_SPEED)
         return "连续频率发送";
+    if (opt->mode == TEST_MODE_MAX_SCLK)
+        return "CGV=0 最大 SCLK 单档测试";
     return "快速完整测试";
 }
 
@@ -235,12 +245,33 @@ static int report_open(const test_options_t *opt)
         }
     }
     clock_gettime(CLOCK_REALTIME, &now);
-    report_printf("# X2600 SPI 60MHz 测试报告\n\n");
+    report_printf("# X2600 SPI 测试报告\n\n");
     report_printf("- 生成时间: %s", ctime(&now.tv_sec));
     report_printf("- 测试模式: `%s`\n", mode_name(opt));
     report_printf("- 驱动源码: "
                   "`/home/devvean/work/linux/module_driver/soc/x2600_510/spi/spi.c`\n");
-    report_printf("- SCLK 目标: 60000000 Hz；SSI 源时钟参数: %u Hz\n\n", opt->ssi_source_hz);
+    if (opt->stress) {
+        report_printf("- SCLK: %u Hz；随机缓冲区: %u KiB；压力时长: %u 秒；SPI 总线: %u；CS: %s\n\n",
+                      TEST_SCLK_HZ,
+                      STRESS_LENGTH / 1024U,
+                      opt->stress_seconds,
+                      opt->bus,
+                      opt->cs);
+    } else if (opt->mode == TEST_MODE_MAX_SCLK) {
+        spi_clock_plan_t plan;
+
+        if (spi_clock_plan_from_mpll(opt->div_ssi_rate, &plan) == 0)
+            report_printf("- MPLL: %" PRIu64 " Hz；输入 div_ssi_rate: %" PRIu64
+                          " Hz；SSICDR 分频: %u；理论实际 div_ssi: %" PRIu64
+                          " Hz；CGV: 0；理论实际 SCLK: %" PRIu64 " Hz\n\n",
+                          SPI_MPLL_HZ,
+                          plan.requested_div_ssi_hz,
+                          plan.ssicdr_divisor,
+                          plan.actual_div_ssi_hz,
+                          plan.actual_sclk_hz);
+    } else {
+        report_printf("- SCLK 目标: 60000000 Hz；SSI 源时钟参数: %u Hz\n\n", opt->ssi_source_hz);
+    }
     report_printf("## 结果明细\n\n| 状态 | 类别 | 用例 | 详情 |\n|---|---|---|---|\n");
     return 0;
 }
@@ -292,6 +323,8 @@ static int parse_mode(const char *text, test_mode_t *mode)
         *mode = TEST_MODE_COMPLETE;
     else if (!strcmp(text, "delay"))
         *mode = TEST_MODE_DELAY;
+    else if (!strcmp(text, "max-sclk"))
+        *mode = TEST_MODE_MAX_SCLK;
     else
         return -1;
     return 0;
@@ -314,6 +347,10 @@ static int parse_args(int argc, char **argv, test_options_t *opt)
             return 1;
         if (!strcmp(argv[i], "--qualification")) {
             opt->qualification = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--stress")) {
+            opt->stress = 1;
             continue;
         }
         if (i + 1 >= argc)
@@ -356,6 +393,13 @@ static int parse_args(int argc, char **argv, test_options_t *opt)
         } else if (!strcmp(argv[i], "--ssi-source-hz")) {
             if (parse_uint(argv[++i], &opt->ssi_source_hz) < 0 || !opt->ssi_source_hz)
                 return -1;
+        } else if (!strcmp(argv[i], "--div-ssi-rate")) {
+            if (parse_uint(argv[++i], &opt->div_ssi_rate) < 0 || !opt->div_ssi_rate)
+                return -1;
+        } else if (!strcmp(argv[i], "--stress-seconds")) {
+            if (parse_uint(argv[++i], &opt->stress_seconds) < 0 ||
+                !spi_stress_seconds_valid(opt->stress_seconds))
+                return -1;
         } else if (!strcmp(argv[i], "--report")) {
             opt->report_name = argv[++i];
         } else {
@@ -366,6 +410,31 @@ static int parse_args(int argc, char **argv, test_options_t *opt)
         return -1;
     if (opt->mode == TEST_MODE_ALWAYS_SPEED && opt->ssi_source_hz && opt->always_speed > max_supported_sclk(opt->ssi_source_hz))
         return -1;
+    if (opt->stress) {
+        if (opt->qualification || opt->mode != TEST_MODE_COMPLETE || opt->div_ssi_rate || opt->always_speed ||
+            opt->ssi_source_hz || opt->hw_cs_specified || opt->bus > 1U)
+            return -1;
+        if (!opt->stress_seconds)
+            opt->stress_seconds = SPI_STRESS_DEFAULT_SECONDS;
+        if (!opt->cs_specified) {
+            const char *default_cs = spi_stress_default_cs(opt->bus);
+
+            if (!default_cs)
+                return -1;
+            snprintf(opt->cs, sizeof(opt->cs), "%s", default_cs);
+        }
+    } else if (opt->stress_seconds) {
+        return -1;
+    }
+    if (opt->mode == TEST_MODE_MAX_SCLK) {
+        spi_clock_plan_t plan;
+
+        if (!opt->div_ssi_rate || opt->qualification || opt->ssi_source_hz ||
+            spi_clock_plan_from_mpll(opt->div_ssi_rate, &plan) < 0)
+            return -1;
+    } else if (opt->div_ssi_rate) {
+        return -1;
+    }
     if (opt->qualification && (opt->mode == TEST_MODE_DELAY || opt->bus_specified || opt->cs_specified || opt->hw_cs_specified ||
                                opt->ssi_source_hz != SSI_SOURCE_60MHZ))
         return -1;
@@ -375,19 +444,23 @@ static int parse_args(int argc, char **argv, test_options_t *opt)
 static void print_usage(const char *name)
 {
     printf("用法: %s [选项]\n", name);
+    printf("  --mode complete|delay|max-sclk  max-sclk 按 CGV=0 测试单档最高 SCLK\n");
     printf("  --mode complete|delay  complete 为默认快速全双工测试；delay 为 CS "
            "时序测试\n");
     printf("  --mode always-speed HZ 连续发送 0x55，供示波器观察 SCLK/MOSI\n");
     printf("  --qualification         自动完成 SPI0 后 SPI1 的 60MHz "
            "正式资格测试\n");
-    printf("  --bus N                 complete/delay 的 SPI 总线，默认 %u\n", DEFAULT_BUS);
-    printf("  --cs GPIO               软件 CS；delay 中指定时测软件 CS\n");
+    printf("  --stress                独立执行 60MHz、64KiB 随机全双工压力测试\n");
+    printf("  --stress-seconds N      --stress 持续时间，默认 %u 秒\n", SPI_STRESS_DEFAULT_SECONDS);
+    printf("  --bus N                 SPI 总线；stress 支持 0/1，默认 %u\n", DEFAULT_BUS);
+    printf("  --cs GPIO               软件 CS；stress 未指定时按总线选择默认 CS\n");
     printf("  --hw-cs GPIO            delay 中测硬件 CE0\n");
-    printf("  --max-transfer N        complete 扫描的逻辑负载字节数，默认 %u\n", DEFAULT_MAX_TRANSFER);
-    printf("  --loops N               complete 每档图样轮数，默认 %u\n", DEFAULT_SCAN_LOOPS);
+    printf("  --max-transfer N        complete/max-sclk 的逻辑负载字节数，默认 %u\n", DEFAULT_MAX_TRANSFER);
+    printf("  --loops N               complete/max-sclk 每档图样轮数，默认 %u\n", DEFAULT_SCAN_LOOPS);
     printf("  --cs-arm-ms N           CS 仪器捕获等待时间，默认 %u ms\n", DEFAULT_CS_ARM_MS);
     printf("  --cs-to-clk-ns N        记录已测得的 CS 到首个 SCLK 间隔\n");
     printf("  --ssi-source-hz HZ      SSI 源时钟；qualification 必须为 120000000\n");
+    printf("  --div-ssi-rate HZ       max-sclk 输入 MD_X2600_510_SPI_CLK_RATE，按 MPLL=1800000000 计算\n");
     printf("  --report FILE           Markdown 报告路径，默认 /tmp\n");
 }
 
@@ -573,8 +646,13 @@ static size_t first_mismatch(const unsigned char *tx, const unsigned char *rx, s
     return SIZE_MAX;
 }
 
-static int
-transfer_buffers(spi_context_t *ctx, unsigned char *tx, unsigned char *rx, size_t len, unsigned int speed, size_t *bad_offset)
+static int transfer_buffers(spi_context_t *ctx,
+                            unsigned char *tx,
+                            unsigned char *rx,
+                            size_t len,
+                            unsigned int speed,
+                            size_t *bad_offset,
+                            spi_timing_t *timing)
 {
     size_t offset = 0;
     size_t limit = ctx->spidev_bufsiz ? ctx->spidev_bufsiz : 1U;
@@ -582,10 +660,19 @@ transfer_buffers(spi_context_t *ctx, unsigned char *tx, unsigned char *rx, size_
     while (offset < len) {
         size_t chunk = len - offset;
         int ret;
+        struct timespec start;
+        struct timespec end;
 
         if (chunk > limit)
             chunk = limit;
+        if (timing)
+            clock_gettime(CLOCK_MONOTONIC, &start);
         ret = raw_transfer(ctx->fd, tx + offset, rx + offset, chunk, speed, 0);
+        if (timing) {
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            if (ret == 0 && spi_timing_record(timing, chunk, speed, elapsed_seconds(&start, &end)) < 0)
+                ret = -EOVERFLOW;
+        }
         if (ret < 0) {
             if (bad_offset)
                 *bad_offset = offset;
@@ -610,7 +697,7 @@ static int checked_transfer(spi_context_t *ctx,
 
     fill_pattern(tx, len, kind, seed);
     memset(rx, 0xa5, len);
-    ret = transfer_buffers(ctx, tx, rx, len, TEST_SCLK_HZ, bad_offset);
+    ret = transfer_buffers(ctx, tx, rx, len, TEST_SCLK_HZ, bad_offset, NULL);
     record_transfer(len, ret != 0);
     return ret;
 }
@@ -698,7 +785,7 @@ static scan_result_t run_frequency_scan(spi_context_t *ctx, const test_options_t
         for (pattern = 0; pattern < opt->scan_loops; pattern++) {
             fill_pattern(tx, opt->max_transfer, pattern % 4U, UINT32_C(0x13579bdf) + pattern);
             memset(rx, 0, opt->max_transfer);
-            ret = transfer_buffers(ctx, tx, rx, opt->max_transfer, speed, &bad);
+            ret = transfer_buffers(ctx, tx, rx, opt->max_transfer, speed, &bad, NULL);
             record_transfer(opt->max_transfer, ret != 0);
             if (ret || add_u64(&bytes, opt->max_transfer) < 0) {
                 if (!ret)
@@ -855,11 +942,14 @@ static int run_duplex_window(spi_context_t *ctx,
     *bytes = 0;
     *seconds = 0.0;
     *bad_offset = SIZE_MAX;
-    if (configure_spi(ctx, SPI_MODE_0, TEST_SCLK_HZ) < 0)
+    if (configure_spi(ctx, SPI_MODE_0, TEST_SCLK_HZ) < 0) {
+        case_result("压力测试", "SPI 配置", -1, "SPI 配置或回读失败");
         return -EINVAL;
+    }
     tx = malloc(len);
     rx = malloc(len);
     if (!tx || !rx) {
+        case_result("压力测试", "测试缓冲区", -1, "分配失败");
         free(tx);
         free(rx);
         return -ENOMEM;
@@ -1014,7 +1104,7 @@ static int run_sample_set(spi_context_t *ctx,
     return 0;
 }
 
-static int run_stress(spi_context_t *ctx, unsigned int bus, uint32_t *seed)
+static int run_stress(spi_context_t *ctx, unsigned int bus, uint32_t *seed, unsigned int duration_seconds)
 {
     unsigned char *tx;
     unsigned char *rx;
@@ -1026,6 +1116,7 @@ static int run_stress(spi_context_t *ctx, unsigned int bus, uint32_t *seed)
     int ret = 0;
     char detail[280];
     double seconds;
+    double last_progress_seconds = 0.0;
 
     if (configure_spi(ctx, SPI_MODE_0, TEST_SCLK_HZ) < 0)
         return -EINVAL;
@@ -1036,7 +1127,7 @@ static int run_stress(spi_context_t *ctx, unsigned int bus, uint32_t *seed)
         free(rx);
         return -ENOMEM;
     }
-    report_printf("\n## SPI%u 90 分钟随机数据压力\n\n", bus);
+    report_printf("\n## SPI%u %u 秒随机数据压力\n\n", bus, duration_seconds);
     clock_gettime(CLOCK_MONOTONIC, &start);
     do {
         ret = checked_transfer(ctx, tx, rx, STRESS_LENGTH, 4U, (*seed)++, &bad);
@@ -1046,7 +1137,18 @@ static int run_stress(spi_context_t *ctx, unsigned int bus, uint32_t *seed)
             break;
         }
         clock_gettime(CLOCK_MONOTONIC, &end);
-    } while (!stop_requested && elapsed_seconds(&start, &end) < STRESS_SECONDS);
+        seconds = elapsed_seconds(&start, &end);
+        if (seconds - last_progress_seconds >= 10.0) {
+            printf("[压力测试] SPI%u 已运行 %.1fs，发送=%" PRIu64 "B transfer=%" PRIu64
+                   " 有效带宽=%.3fMbit/s\n",
+                   bus,
+                   seconds,
+                   bytes,
+                   transfers,
+                   seconds > 0.0 ? (bytes * 8.0 / 1000000.0) / seconds : 0.0);
+            last_progress_seconds = seconds;
+        }
+    } while (!stop_requested && seconds < (double)duration_seconds);
     clock_gettime(CLOCK_MONOTONIC, &end);
     seconds = elapsed_seconds(&start, &end);
     free(tx);
@@ -1072,6 +1174,23 @@ static int run_stress(spi_context_t *ctx, unsigned int bus, uint32_t *seed)
              seconds > 0.0 ? (bytes * 8.0 / 1000000.0) / seconds : 0.0);
     case_result("压力测试", "外部全双工随机数据", 1, detail);
     return 0;
+}
+
+static int run_stress_mode(const test_options_t *opt, size_t spidev_bufsiz)
+{
+    spi_context_t ctx;
+    uint32_t seed = UINT32_C(0x9e3779b9) ^ opt->bus;
+    int ret;
+
+    if (spi_context_init(&ctx, opt->bus, opt->cs, spidev_bufsiz) < 0) {
+        case_result("SPI 初始化", opt->cs, -1, "注册或打开 spidev 失败");
+        return -1;
+    }
+    case_result("SPI 初始化", opt->cs, 1, ctx.path);
+    print_driver_parameters(opt->bus);
+    ret = run_stress(&ctx, opt->bus, &seed, opt->stress_seconds);
+    spi_context_deinit(&ctx);
+    return ret;
 }
 
 static int run_qualification_bus(const qualification_profile_t *profile, const test_options_t *opt, size_t spidev_bufsiz)
@@ -1122,7 +1241,7 @@ static int run_qualification_bus(const qualification_profile_t *profile, const t
             }
         }
     }
-    if (!failed && run_stress(&ctx, profile->bus, &seed) < 0)
+    if (!failed && run_stress(&ctx, profile->bus, &seed, SPI_STRESS_DEFAULT_SECONDS) < 0)
         failed = 1;
     spi_context_deinit(&ctx);
     return failed ? -1 : 0;
@@ -1163,6 +1282,145 @@ static int run_complete(const test_options_t *opt, size_t spidev_bufsiz)
     case_result("快速完整测试", "最高无错档", scan.highest_speed ? 1 : -1, detail);
     spi_context_deinit(&ctx);
     return scan.highest_speed ? 0 : -1;
+}
+
+static int run_max_sclk(const test_options_t *opt, size_t spidev_bufsiz)
+{
+    spi_clock_plan_t plan;
+    spi_context_t ctx;
+    unsigned char *tx = NULL;
+    unsigned char *rx = NULL;
+    struct timespec start;
+    struct timespec end;
+    uint64_t bytes = 0;
+    unsigned int speed;
+    unsigned int pattern;
+    size_t bad = SIZE_MAX;
+    spi_timing_t timing;
+    double seconds;
+    double mbps;
+    double non_data_seconds;
+    int ret = 0;
+    char detail[300];
+
+    if (spi_clock_plan_from_mpll(opt->div_ssi_rate, &plan) < 0 || plan.actual_sclk_hz > UINT_MAX) {
+        case_result("理论时钟", "CGV=0", -1, "div_ssi_rate 无法由 MPLL 整数分频表示");
+        return -1;
+    }
+    speed = (unsigned int)plan.actual_sclk_hz;
+    snprintf(detail,
+             sizeof(detail),
+             "MPLL=%" PRIu64 "Hz 输入 div_ssi_rate=%" PRIu64 "Hz SSICDR 分频=%u "
+             "理论 div_ssi=%" PRIu64 "Hz CGV=0 理论 SCLK=%uHz",
+             SPI_MPLL_HZ,
+             plan.requested_div_ssi_hz,
+             plan.ssicdr_divisor,
+             plan.actual_div_ssi_hz,
+             speed);
+    printf("[理论时钟] %s\n", detail);
+    case_result("理论时钟", "CGV=0", 1, detail);
+    if (spi_context_init(&ctx, opt->bus, opt->cs, spidev_bufsiz) < 0) {
+        case_result("SPI 初始化", opt->cs, -1, "注册或打开 spidev 失败");
+        return -1;
+    }
+    case_result("SPI 初始化", opt->cs, 1, ctx.path);
+    print_driver_parameters(opt->bus);
+    if (configure_spi(&ctx, SPI_MODE_0, speed) < 0) {
+        case_result("CGV=0 单档测试", "SPI 配置", -1, "SPI 配置或回读失败");
+        spi_context_deinit(&ctx);
+        return -1;
+    }
+    tx = malloc(opt->max_transfer);
+    rx = malloc(opt->max_transfer);
+    if (!tx || !rx) {
+        case_result("CGV=0 单档测试", "测试缓冲区", -1, "分配失败");
+        free(tx);
+        free(rx);
+        spi_context_deinit(&ctx);
+        return -1;
+    }
+    spi_timing_init(&timing);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (pattern = 0; pattern < opt->scan_loops; pattern++) {
+        fill_pattern(tx, opt->max_transfer, pattern % 4U, UINT32_C(0x13579bdf) + pattern);
+        memset(rx, 0, opt->max_transfer);
+        ret = transfer_buffers(&ctx, tx, rx, opt->max_transfer, speed, &bad, &timing);
+        record_transfer(opt->max_transfer, ret != 0);
+        if (ret || add_u64(&bytes, opt->max_transfer) < 0) {
+            if (!ret)
+                ret = -EOVERFLOW;
+            break;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    seconds = elapsed_seconds(&start, &end);
+    mbps = seconds > 0.0 ? (bytes * 8.0 / 1000000.0) / seconds : 0.0;
+    non_data_seconds = spi_timing_non_data_seconds(&timing);
+    if (ret) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "理论 SCLK=%uHz 轮数=%u 返回=%d 首个错误偏移=%zu 完成=%" PRIu64
+                 "B 有效带宽=%.2fMbit/s",
+                 speed,
+                 pattern,
+                 ret,
+                 bad,
+                 bytes,
+                 mbps);
+        case_result("CGV=0 单档测试", "外部全双工", -1, detail);
+    } else {
+        snprintf(detail,
+                 sizeof(detail),
+                 "理论 SCLK=%uHz 图样轮数=%u 完成=%" PRIu64 "B 有效带宽=%.2fMbit/s",
+                 speed,
+                 opt->scan_loops,
+                 bytes,
+                 mbps);
+        case_result("CGV=0 单档测试", "外部全双工", 1, detail);
+    }
+    snprintf(detail,
+             sizeof(detail),
+             "ioctl 次数=%" PRIu64 " 每次理论数据周期=%.3fus 每次实测 ioctl 周期=%.3fus",
+             timing.ioctl_count,
+             spi_timing_average_theoretical_seconds(&timing) * 1000000.0,
+             spi_timing_average_ioctl_seconds(&timing) * 1000000.0);
+    printf("[传输时序] %s\n", detail);
+    case_result("传输时序", "单次平均周期", timing.ioctl_count ? 1 : -1, detail);
+    snprintf(detail,
+             sizeof(detail),
+             "理论数据总时间=%.6fs 实测 ioctl 总时间=%.6fs ioctl 数据占空比=%.2f%%",
+             timing.theoretical_seconds,
+             timing.ioctl_seconds,
+             spi_timing_ioctl_duty_percent(&timing));
+    printf("[传输时序] %s\n", detail);
+    case_result("传输时序", "ioctl 数据时间", timing.ioctl_count ? 1 : -1, detail);
+    if (non_data_seconds >= 0.0) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "ioctl 内非数据时间=%.6fs，平均每次=%.3fus（含系统调用、驱动、调度和 CS 间隙）",
+                 non_data_seconds,
+                 timing.ioctl_count ? non_data_seconds * 1000000.0 / (double)timing.ioctl_count : 0.0);
+        printf("[传输时序] %s\n", detail);
+        case_result("传输时序", "ioctl 内非数据时间", timing.ioctl_count ? 1 : -1, detail);
+    } else {
+        snprintf(detail,
+                 sizeof(detail),
+                 "实测 ioctl 时间比理论数据时间少 %.6fs，不能将该差值解释为开销",
+                 -non_data_seconds);
+        printf("[传输时序] %s\n", detail);
+        case_result("传输时序", "ioctl 内非数据时间", 0, detail);
+    }
+    snprintf(detail,
+             sizeof(detail),
+             "整轮实测总时间=%.6fs 理论数据时间占整轮=%.2f%%",
+             seconds,
+             spi_timing_wall_duty_percent(&timing, seconds));
+    printf("[传输时序] %s\n", detail);
+    case_result("传输时序", "整轮数据占空比", timing.ioctl_count ? 1 : -1, detail);
+    free(tx);
+    free(rx);
+    spi_context_deinit(&ctx);
+    return ret ? -1 : 0;
 }
 
 static int run_always_speed(const test_options_t *opt, size_t spidev_bufsiz)
@@ -1304,10 +1562,14 @@ int main(int argc, char **argv)
     report_printf("\n## 参数\n\n- spidev 缓冲区: %zuB\n", spidev_bufsiz);
     if (opt.qualification)
         ret = run_qualification(&opt, spidev_bufsiz);
+    else if (opt.stress)
+        ret = run_stress_mode(&opt, spidev_bufsiz);
     else if (opt.mode == TEST_MODE_DELAY)
         ret = run_delay(&opt, spidev_bufsiz);
     else if (opt.mode == TEST_MODE_ALWAYS_SPEED)
         ret = run_always_speed(&opt, spidev_bufsiz);
+    else if (opt.mode == TEST_MODE_MAX_SCLK)
+        ret = run_max_sclk(&opt, spidev_bufsiz);
     else
         ret = run_complete(&opt, spidev_bufsiz);
     if (report_close() < 0)
