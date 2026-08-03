@@ -153,8 +153,18 @@ Markdown 报告包含每个用例的中位数、最小值、最大值、均值�
 framebuffer；持续压力应使用无限循环随机写入的 `fb-test-rect`。
 
 每路 SPI 的 MOSI/MISO 仍须按“硬件条件”短接，且 SPI1 的 PC25-PC30 不能被 MSC1 或其他
-动态 SPI 设备占用。开始测试前确认不存在遗留的 `/dev/spidev0.*` 或 `/dev/spidev1.*`；如有，
-重启并确认设备已释放后再运行测试。
+动态 SPI 设备占用。`app_spi` 会动态注册并在正常退出时注销 spidev；异常停止后可能遗留
+`/dev/spidev1.0`。不要使用 `rm` 删除设备节点。对于 SPI1/PC30 测试，在确认没有其他程序使用
+该设备后，使用 `cmd_spi` 通过 `/dev/spidev_helper` 注销：
+
+```sh
+cmd_spi del_dev /dev/spidev1.0
+test ! -e /dev/spidev1.0 || exit 1
+```
+
+`cmd_spi` 必须存在；当前 `x2600_nor_5.10_defconfig` 已启用 `APP_libhardware2_spi_cmd`。若命令
+缺失或注销失败，停止测试并重启后确认节点已释放。SPI0 测试的遗留节点使用相同方法替换为
+`/dev/spidev0.0`。
 
 ```sh
 # 目标机执行；app_spi 已放在 /tmp
@@ -162,7 +172,7 @@ mkdir -p /tmp/spi-stress
 cd /tmp
 
 ls -l /dev/fb0 /dev/spidev*
-which memtester fb-test-rect
+which memtester fb-test-rect cmd_spi
 
 # 极限内存压力：按启动压力前的 MemAvailable 计算，预留 5MiB。
 # 该值只控制两个 memtester 的申请量；app_spi 运行后的实际剩余内存会继续波动。
@@ -197,7 +207,9 @@ kill -0 "$fb" || exit 1
 echo "MemAvailable after stress start: $(awk '$1 == "MemAvailable:" { print $2 / 1024 " MiB" }' /proc/meminfo)"
 
 ./app_spi --qualification --ssi-source-hz 120000000 --report /tmp/spi-stress/spi_qualification.md
+
 result=$?
+dmesg > /tmp/spi-stress/dmesg.log
 
 cleanup
 trap - EXIT INT TERM
@@ -215,9 +227,195 @@ SPI 结果只能说明极限内存耗尽时的行为，不能作为“60MHz SPI 
 稳定性结论，恢复 `reserve_mb=64`；若第二个 `memtester` 在 5MiB 设置下无法启动，说明系统
 启动开销已超过可承受范围，应调大 `reserve_mb`，而不是强行继续。
 
-测试结束后检查 `/tmp/spi-stress/spi1_stress.md`、两个 `memtester` 日志、
+测试结束后检查 `/tmp/spi-stress/spi_qualification.md`、两个 `memtester` 日志、
 `fb-test-rect.log` 和 `dmesg`。SPI 报告的“失败”和“数据错误”必须为零；`dmesg` 中不能出现
 `Out of memory`、`Killed process` 或 SPI 超时。
+
+## 临界压力与引脚波形测试
+
+资格测试证明某一压力等级下端到端随机数据正确。下表用于首次建立某种负载的压力边界、增加或
+替换后台负载后重新定位，或已经出现异常时缩小复现范围。先在无后台任务时建立基线，再在每个
+等级启动两个 `memtester`、一个 `fb-test-rect` 后运行 SPI1 的 600 秒独立压力测试。每级至少
+重复三次；某级首次出现数据错误、SPI 返回错误或吞吐量异常下降时，不再提升压力，保留该等级
+复现和采集波形。
+
+| 等级 | `reserve_mb` | 目的 |
+|---|---:|---|
+| 0 | 不启动后台任务 | SPI 基线 |
+| 1 | 64 | 轻度内存压力 |
+| 2 | 32 | 中度内存压力 |
+| 3 | 16 | 重度内存压力 |
+| 4 | 5 | 极限内存压力 |
+
+若同一固件、同一 SPI 配置和同一组后台任务已经在等级 4 完整资格测试通过，则该组负载的更低
+等级无需再补跑；等级 4 已覆盖这组任务可达到的最高内存压力。此时要继续探索 SPI 的临界条件，
+应新增实际业务负载，例如真实 LCD/DPU、视频编解码、摄像头、网络或存储，而不是重复较轻的
+内存等级。
+
+等级 1 至 4 使用上一节的启动脚本，只修改 `reserve_mb`，并将资格测试命令替换为：
+
+```sh
+./app_spi --stress --bus 1 --stress-seconds 600 --report /tmp/spi-stress/spi1_level.md
+```
+
+每级完成后检查报告的“失败”和“数据错误”是否为零，并保存两个 `memtester` 日志、
+`fb-test-rect.log` 和 `dmesg`。`reserve_mb` 不能低于 5；更低的值主要触发 OOM，不能用于判断
+SPI 的稳定性临界点。找到最高无错等级后，再以该等级运行完整资格测试。
+
+`--stress` 在当前 `spidev.bufsiz=4096B` 时，会将每个 64KiB 随机缓冲区分为多个 SPI message。
+每个 4KiB message 在 60MHz 下的纯数据时间约为 546us。`app_spi` 将 `cs_change` 设为 0，驱动
+会在同一设备的相邻 message 间保持软件 CS 有效；但每个 4KiB DMA 传输完成时 FIFO 为空，硬件
+传输结束，下一段须经 ioctl 和 DMA 重新提交。因此 SCLK 在约 4KiB 边界处停止，即使 CS 仍有效，
+也属于当前传输路径的正常分段行为，不能直接当作异常。若要确认“有 SCLK 但 MOSI 无数据”或异常
+空白，必须在复现压力等级下用示波器或逻辑分析仪同时采集 SPI1 的 PC25(SCLK)、PC26(MOSI)、
+PC30(CS) 和 GND，并运行：
+
+```sh
+./app_spi --mode always-speed 60000000 --bus 1 --cs pc30 --ssi-source-hz 120000000
+```
+
+该模式连续发送 `0x55`，MOSI 应为重复的 `01010101`，便于观察时钟连续时 MOSI 是否停滞或异常。
+它不做 RX 数据校验，必须与上述 `--stress` 随机全双工校验分开运行。约 4KiB 边界处的 SCLK 空档
+是当前路径的正常现象；单个 4KiB message 内出现空档、SCLK 连续而 MOSI 不符合 `0x55`、内核出现
+`SPI%d transmit underrun`，或 `--stress` 报告随机数据错误，才是需要结合波形和 `dmesg` 进一步
+定位的异常。
+
+### MOSI 波形对照场景
+
+两个场景都使用上一节的两个 `memtester`、`fb-test-rect` 和 `reserve_mb=5`，保持约 5MiB 剩余
+内存。示波器 CH1 接 PC25(SCLK)、CH2 接 PC26(MOSI)、CH3 接 PC30(CS)，探头地接开发板 GND。
+使用 10x 探头，采样率至少 500MSa/s、带宽建议 200MHz 以上；以 CS 下降沿触发，记录窗口至少 1ms，
+并开启余辉或分段采集。放大至约 20ns/div 后检查单 bit 的 MOSI。
+
+场景 A 用于建立内存和虚拟 framebuffer 压力下的基线。启动上一节全部后台任务并完成存活检查后，
+将资格测试命令替换为以下命令，采集至少 30 秒后按 `Ctrl-C`：
+
+```sh
+./app_spi --mode always-speed 60000000 --bus 1 --cs pc30 --ssi-source-hz 120000000 --report /tmp/spi-stress/spi1_wave_memfb.md
+```
+
+场景 B 只在场景 A 完成并清理全部后台任务后执行。重新启动同一组后台任务，但先将
+`reserve_mb` 设为 16，再在 `fb-test-rect` 启动后增加一个 CPU 调度竞争进程：
+
+```sh
+yes >/dev/null 2>&1 &
+cpu=$!
+sleep 1
+kill -0 "$cpu" || exit 1
+```
+
+将 `cpu` 加入清理函数：
+
+```sh
+cleanup() {
+    kill "$mem1" "$mem2" "$fb" "$cpu" 2>/dev/null
+    wait "$mem1" "$mem2" "$fb" "$cpu" 2>/dev/null
+}
+```
+
+然后运行同一波形命令，并使用不同报告文件：
+
+```sh
+./app_spi --mode always-speed 60000000 --bus 1 --cs pc30 --ssi-source-hz 120000000 --report /tmp/spi-stress/spi1_wave_memfb_cpu.md
+```
+
+每轮结束后、清理后台任务前导出内核日志：
+
+```sh
+dmesg > /tmp/spi-stress/dmesg.log
+```
+
+比较两个场景的约 4KiB 数据段间空档宽度和抖动。两个 `memtester` 已提供 CPU/DDR 负载；场景 B 的
+`yes` 仅增加调度竞争。若场景 B 波形无变化，不应继续降低 `reserve_mb`，而应改用真实 LCD/DPU、
+视频编解码、摄像头、网络或 USB 等 DMA/中断负载。两个场景完成后，应在同样的后台负载下重新运行
+`--stress` 随机全双工测试，确认波形观察到的异常是否同时造成数据校验错误。
+
+场景 B 不应在 `reserve_mb=5` 下直接执行。该组合可能使 DMA 引擎无法分配软件描述符；当前 SPI
+驱动在 `device_prep_slave_sg()` 返回空描述符时调用 `BUG()`，会触发内核异常，而不是将错误返回给
+`app_spi`。在驱动改为可恢复的 `-ENOMEM` 错误处理前，CPU 竞争场景从 `reserve_mb=16` 开始；需要
+继续降低内存时，每次只降低一个等级，并在每轮后检查 `dmesg`。
+
+### 串口前台与 ADB 递增加压
+
+该流程用于在示波器持续观察 MOSI 时逐项加入负载，定位首个导致波形异常的压力源。串口前台只
+运行 `app_spi`；ADB shell 只启动和停止后台任务。开始前处理遗留 `/dev/spidev1.0`，然后在串口
+终端运行：
+
+```sh
+cd /tmp
+./app_spi --mode always-speed 60000000 --bus 1 --cs pc30 --ssi-source-hz 120000000 --report /tmp/spi-stress/wave-live.md
+```
+
+示波器连接 PC25(SCLK)、PC26(MOSI)、PC30(CS) 与 GND。约 4KiB 数据段的 SCLK 空档是当前 DMA
+分段的正常现象；单个 4KiB 段内部出现空档，或 SCLK 连续时 MOSI 不再是 `01010101`，才是异常。
+
+在 ADB shell 中创建日志目录后，每次只增加一个后台任务，每级观察 20 至 30 秒并记录示波器结果：
+
+```sh
+cd /tmp
+mkdir -p /tmp/spi-stress
+
+memtester 8M 0 >/tmp/spi-stress/memtester-1.log 2>&1 &
+mem1=$!
+sleep 2
+kill -0 "$mem1"
+awk '$1 == "MemAvailable:" { print $2 / 1024 " MiB" }' /proc/meminfo
+```
+
+再依次执行：
+
+```sh
+memtester 8M 0 >/tmp/spi-stress/memtester-2.log 2>&1 &
+mem2=$!
+sleep 2
+kill -0 "$mem2"
+awk '$1 == "MemAvailable:" { print $2 / 1024 " MiB" }' /proc/meminfo
+```
+
+```sh
+fb-test-rect -f 0 -s 1 >/tmp/spi-stress/fb-test-rect.log 2>&1 &
+fb=$!
+sleep 2
+kill -0 "$fb"
+```
+
+```sh
+yes >/dev/null 2>&1 &
+cpu=$!
+sleep 1
+kill -0 "$cpu"
+```
+
+需要继续增加内存时，每次增加一个 8MiB `memtester`，例如：
+
+```sh
+memtester 8M 0 >/tmp/spi-stress/memtester-3.log 2>&1 &
+mem3=$!
+sleep 2
+kill -0 "$mem3"
+awk '$1 == "MemAvailable:" { print $2 / 1024 " MiB" }' /proc/meminfo
+```
+
+每级检查串口中的 `SPI: failed to transfer`，并在 ADB shell 执行 `dmesg` 检查
+`SPI1 transmit underrun`、DMA 错误和 `page allocation failure`。出现首个异常时停止继续加压，立即
+保存：
+
+```sh
+dmesg > /tmp/spi-stress/dmesg.log
+```
+
+停止串口中的 `always-speed` 后，在 ADB shell 清理全部后台任务：
+
+```sh
+kill "$mem1" "$mem2" "$mem3" "$fb" "$cpu" 2>/dev/null
+wait "$mem1" "$mem2" "$mem3" "$fb" "$cpu" 2>/dev/null
+```
+
+按 `Ctrl-C` 停止 `always-speed` 时，当前驱动可能将信号中断误报为 `rx transfer timeout`；该信息不能
+单独判定为 MOSI 数据断开，必须结合停止前的波形和 `dmesg` 判断。
+
+虚拟 framebuffer 只产生 CPU 和内存写压力，不覆盖真实 LCD/DPU 的 DMA、中断和显示链路。最终的
+真实业务验证应将该任务替换为产品实际使用的显示、编解码、网络或存储负载。
 
 ## 独立压力测试
 
