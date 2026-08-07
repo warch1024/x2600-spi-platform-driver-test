@@ -5,8 +5,23 @@
 ## 硬件条件
 
 `x2600_nor_5.10_defconfig` 同时启用两路控制器，并将 `div_ssi` 请求为
-120MHz。SSI 最快分频档对应 60MHz SCLK。将板端结果作为引脚级结论前，必须用
-示波器确认实际 SCLK 为 60MHz。
+120MHz。当前 `spi.c` 选择的 `div_ssi` 时钟源配合该配置时，SSI 最快分频档对应
+60MHz SCLK。将板端结果作为引脚级结论前，必须用示波器确认实际 SCLK 为 60MHz。
+
+### 时钟配置与测试范围
+
+`app_spi` 的频率参数只会通过 spidev 请求传输速率，不能修改 `div_ssi` 的实际时钟源
+或频率。变更硬件时钟后，须重新编译固件并重新加载 `soc_spi.ko`，再以示波器确认引脚
+频率。
+
+| 目的 | 必须修改的固件项 | 可使用的测试 |
+|---|---|---|
+| 切换 `div_ssi` 时钟源并改变该源下的测试频率 | `spi.c` 的 `div_ssi` 时钟源，以及 `x2600_nor_5.10_defconfig` 的 `MD_X2600_510_SPI_CLK_RATE` | `complete` 扫描和 `always-speed` 波形观察；传入与实际 `div_ssi` 一致的 `--ssi-source-hz` |
+| 保持 `spi.c` 的 CGV=0/MPLL 时钟源，只改变 `div_ssi` 请求频率 | `x2600_nor_5.10_defconfig` 的 `MD_X2600_510_SPI_CLK_RATE` | `max-sclk`；传入同一数值的 `--div-ssi-rate` |
+
+`delay`、`stress` 和 `qualification` 的测试内容包含固定 60MHz 用例：前两者使用程序内的
+60MHz 请求，`qualification` 还要求 `--ssi-source-hz 120000000`。它们不是通过调整命令行
+频率参数进行变频的测试；硬件时钟改为非 120MHz 配置后，不能将其结果作为 60MHz 资格结论。
 
 | 总线 | SCLK | MOSI | MISO | 软件 CS | 硬件 CE0 |
 |---|---|---|---|---|---|
@@ -33,7 +48,8 @@ make app
 
 快速完整测试在外部全双工数据校验下扫描
 1/5/10/20/25/50/60MHz。每档使用四种数据图样，报告最高无错请求频率和有效负载
-带宽。
+带宽。`--ssi-source-hz` 是当前实际 `div_ssi` 频率的校验输入，程序据此跳过理论上不可能
+达到的请求档；它不设置硬件时钟，也不保证驱动最终输出该频率。
 
 ```sh
 # SPI0
@@ -48,9 +64,10 @@ make app
 
 ## CGV=0 单档超频测试
 
-每次重新编译固件并使用新的 `MD_X2600_510_SPI_CLK_RATE` 加载 `soc_spi.ko` 后，使用
-`max-sclk` 模式验证该 `div_ssi` 配置下的最高 `CGV=0` SPI 速率。程序按 MPLL=1800MHz
-和整数 `SSICDR` 分频计算理论实际频率：
+在 `spi.c` 保持 CGV=0/MPLL 时钟源时，每次重新编译固件并使用新的
+`MD_X2600_510_SPI_CLK_RATE` 加载 `soc_spi.ko` 后，使用 `max-sclk` 模式验证该
+`div_ssi` 配置下的最高 CGV=0 SPI 速率。程序按 MPLL=1800MHz 和整数 `SSICDR` 分频计算
+理论实际频率：
 
 ```text
 SSICDR 分频 = round(1800000000 / MD_X2600_510_SPI_CLK_RATE)
@@ -67,7 +84,10 @@ SCLK=`81818181`Hz。所有计算和 SPI 请求均使用整数 Hz；小数 MHz �
 
 该模式只执行一个 CGV=0 频率档，使用与快速完整测试相同的四种数据图样、外部 MOSI/MISO
 全双工逐字节比较和 `--loops` 轮测试；`--max-transfer` 和 `--loops` 同样适用于该模式。
-报告会回显输入的 `div_ssi_rate`、整数 `SSICDR` 分频、理论实际 `div_ssi` 和理论实际 SCLK，
+`--div-ssi-rate` 仅供程序按上述 MPLL 分频规则计算请求速率并回显；它不写入 defconfig、
+不重载驱动，也不设置 `div_ssi`。该参数必须与已构建并加载的
+`MD_X2600_510_SPI_CLK_RATE` 相同。报告会回显输入的 `div_ssi_rate`、整数 `SSICDR` 分频、
+理论实际 `div_ssi` 和理论实际 SCLK，
 并统计每个 spidev 分块的理论数据周期、实测 `spi_transfer()` 周期、ioctl 内数据占空比、
 ioctl 内非数据时间，以及理论数据时间占整个测试的比例。非数据时间包含系统调用、驱动、
 调度和 CS 间隙，不能将它理解成纯 CPU ioctl 指令开销；最终 SCLK 必须由示波器确认。
@@ -79,9 +99,17 @@ ioctl 内非数据时间，以及理论数据时间占整个测试的比例。�
 检测到的 `spidev.bufsiz` 的 message，不申请 RX 缓冲区，也不进行数据校验，因此
 无需短接 MOSI/MISO。
 
+`always-speed HZ` 中的 `HZ` 是要请求的 SCLK，不是 `div_ssi` 频率。按当前硬件时钟配置选择
+可实现的请求值，并将 `--ssi-source-hz` 填为实际 `div_ssi` 频率。例如 `div_ssi=120MHz` 的
+最快档请求 60MHz；若实际 `div_ssi=100MHz`，则请求 50MHz。该参数只作理论上限校验，不会
+切换 `spi.c` 的时钟源或修改 `MD_X2600_510_SPI_CLK_RATE`。
+
 ```sh
 # 默认 SPI1/PC30 软件 CS，观察 PC25(SCLK)、PC26(MOSI) 与 GND
 ./app_spi --mode always-speed 60000000 --ssi-source-hz 120000000
+
+# div_ssi=100MHz 时，观察理论 50MHz SCLK
+./app_spi --mode always-speed 50000000 --ssi-source-hz 100000000
 
 # SPI0，观察 PD00(SCLK)、PD01(MOSI) 与 GND
 ./app_spi --mode always-speed 60000000 --bus 0 --cs pc09 --ssi-source-hz 120000000

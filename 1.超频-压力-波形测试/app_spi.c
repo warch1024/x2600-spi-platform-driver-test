@@ -459,8 +459,8 @@ static void print_usage(const char *name)
     printf("  --loops N               complete/max-sclk 每档图样轮数，默认 %u\n", DEFAULT_SCAN_LOOPS);
     printf("  --cs-arm-ms N           CS 仪器捕获等待时间，默认 %u ms\n", DEFAULT_CS_ARM_MS);
     printf("  --cs-to-clk-ns N        记录已测得的 CS 到首个 SCLK 间隔\n");
-    printf("  --ssi-source-hz HZ      SSI 源时钟；qualification 必须为 120000000\n");
-    printf("  --div-ssi-rate HZ       max-sclk 输入 MD_X2600_510_SPI_CLK_RATE，按 MPLL=1800000000 计算\n");
+    printf("  --ssi-source-hz HZ      实际 SSI 源时钟的校验输入；不设置硬件时钟，qualification 必须为 120000000\n");
+    printf("  --div-ssi-rate HZ       max-sclk 的 MD_X2600_510_SPI_CLK_RATE 计算输入；不设置硬件时钟\n");
     printf("  --report FILE           Markdown 报告路径，默认 /tmp\n");
 }
 
