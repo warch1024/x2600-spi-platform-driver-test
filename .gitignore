@@ -1,6 +1,8 @@
 .*
 !.gitignore
 tests/
+!2.从机模式测试/tests/
+!2.从机模式测试/tests/**
 test_results/*
 docs/
 work_linux_modify_record/
